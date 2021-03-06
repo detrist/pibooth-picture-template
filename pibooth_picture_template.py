@@ -172,7 +172,7 @@ class TemplateParser(object):
         if '=' not in style[0]:
             styledict['name'] = style.pop(0)
         for key_value in style:
-            key, value = key_value.split('=')
+            key, value = key_value.split('=', 1)
             styledict[key] = value
         return styledict
 
