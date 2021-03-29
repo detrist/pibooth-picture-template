@@ -4,10 +4,16 @@
 
 import zlib
 import base64
+import numpy as np
 import os.path as osp
 from urllib.parse import unquote
 from xml.etree import ElementTree
 from PIL import Image, ImageDraw
+
+try:
+    from BytesIO import BytesIO ## for Python 2
+except ImportError:
+    from io import BytesIO ## for Python 3
 
 import pibooth
 from pibooth import fonts
@@ -129,6 +135,22 @@ class TemplateParser(object):
                                    capture.get('value'))
                     posy = posy % size[1]
                 subdata.setdefault('captures', []).append((posx, posy, width, height, rotation))
+            
+            foregrounds = self.parse_foregrounds(template)
+            for foreground in foregrounds:
+                style = self.parse_style(foreground)
+                rotation = -int(style.get('rotation', 0))
+                posx, posy, width, height = self.parse_geometry(foreground, dpi)
+                image = self.convert_foreground(style.get('image'), width, height)
+                if posx + width <= 0 or posx >= size[0]:  # If foreground is on the left or the right of the page
+                    LOGGER.warning("Template foreground '%s' X-position out of bounds, try to auto-adjust",
+                                   foreground.get('value'))
+                    posx = posx % size[0]
+                if posy + height <= 0 or posy >= size[1]:  # If foreground is above or below the page
+                    LOGGER.warning("Template foreground '%s' Y-position out of bounds, try to auto-adjust",
+                                   foreground.get('value'))
+                    posy = posy % size[1]
+                subdata.setdefault('foregrounds', []).append((posx, posy, width, height, rotation, image))
 
             texts = self.parse_texts(template)
             for text in texts:
@@ -197,12 +219,28 @@ class TemplateParser(object):
         :param mxgraph_node: 'mxGraphModel' node
         :type mxgraph_node: :py:class:`ElementTree.Element`
         """
+        LOGGER.info("mxgraph_node: %s", mxgraph_node)
         captures = [cell for cell in mxgraph_node.iter('mxCell')
-                    if cell.get('vertex') == "1" and not cell.get('style').startswith('text;')]
+                    if cell.get('vertex') == "1" and not cell.get('style').startswith('text;') 
+                        and not cell.get('style').startswith('shape=image;')]
         if len(captures) > 4 or len(captures) < 1:
             raise TemplateParserError("Too many captures positions ({}) in template '{}' (1 to 4 expected)".format(
                 len(captures), mxgraph_node.get('name')))
         return sorted(captures, key=lambda x: x.get('value'))
+
+    def parse_foregrounds(self, mxgraph_node):
+        """Parse foreground nodes.
+
+        :param mxgraph_node: 'mxGraphModel' node
+        :type mxgraph_node: :py:class:`ElementTree.Element`
+        """
+        LOGGER.info("mxgraph_node: %s", mxgraph_node)
+        captures = [cell for cell in mxgraph_node.iter('mxCell')
+                    if cell.get('vertex') == "1" and cell.get('style').startswith('shape=image;')]
+        if len(captures) > 1:
+            raise TemplateParserError("Too many captures positions ({}) in template '{}' (1 to 4 expected)".format(
+                len(captures), mxgraph_node.get('name')))
+        return captures
 
     def parse_texts(self, mxgraph_node):
         """Parse text nodes.
@@ -213,6 +251,12 @@ class TemplateParser(object):
         texts = [cell for cell in mxgraph_node.iter('mxCell')
                  if cell.get('vertex') == "1" and cell.get('style').startswith('text;')]
         return sorted(texts, key=lambda x: x.get('value'))
+    
+    def convert_foreground(self, data, width, height):
+        """Parse stylesheet and returns with PIL Image.
+        """
+        foreground_bytes = base64.b64decode(str(data).split(',', 1)[1].encode('ascii'))
+        return Image.open(BytesIO(foreground_bytes)).resize((width, height))
 
     def get(self, key, capture_number, orientation=pictures.PORTRAIT):
         """Return the value of the 'key' info for the given caputures numbers.
@@ -230,7 +274,9 @@ class TemplateParser(object):
         if capture_number not in self.data[orientation]:
             raise TemplateParserError(
                 "No template for '{}' captures (orientation={})".format(capture_number, orientation))
-        return self.data[orientation][capture_number][key]
+        if key in self.data[orientation][capture_number]:
+            return self.data[orientation][capture_number][key]
+        return {}
 
     def get_best_orientation(self, captures):
         """Return the best orientation (PORTRAIT or LANDSCAPE), depending on the
@@ -281,6 +327,16 @@ class TemplateParser(object):
         """
         return self.get('captures', capture_number, orientation)
 
+    def get_foreground_rects(self, capture_number, orientation=pictures.PORTRAIT):
+        """Return the list of top-left coordinates and max size rectangle.
+
+        :param capture_number: number of captures to assemble
+        :type capture_number: int
+        :param orientation: 'portrait' or 'landscape'
+        :type orientation: str
+        """
+        return self.get('foregrounds', capture_number, orientation)
+
     def get_text_rects(self, capture_number, orientation=pictures.PORTRAIT):
         """Return the list of top-left coordinates and max size rectangle.
 
@@ -290,7 +346,7 @@ class TemplateParser(object):
         :type orientation: str
         """
         return self.get('texts', capture_number, orientation)
-
+    
 
 class TemplatePictureFactory(PilPictureFactory):
 
@@ -307,6 +363,15 @@ class TemplatePictureFactory(PilPictureFactory):
         :rtype: tuple
         """
         for rect in self.template.get_capture_rects(len(self._images), self.orientation):
+            yield rect
+    
+    def _iter_foreground_rects(self):
+        """Yield top-left coordinates and max size rectangle for each source image.
+
+        :return: (image_x, image_y, image_width, image_height, image_angle, image)
+        :rtype: tuple
+        """
+        for rect in self.template.get_foreground_rects(len(self._images), self.orientation):
             yield rect
 
     def _iter_texts_rects(self, interline=None):
@@ -357,6 +422,18 @@ class TemplatePictureFactory(PilPictureFactory):
             rect = Image.new('RGBA', (max_w, max_h), (255, 0, 0, 0))
             self._image_paste(src_image, rect, (max_w - width) // 2, (max_h - height) // 2)
             self._image_paste(rect, image, pos_x, pos_y, rotation)
+        return image
+    
+    def _build_foreground(self, image):
+        """Draw the foreground images on the given image.
+
+        :param image: image to draw on
+        :type image: :py:class:`PIL.Image`
+        :return: drawn image
+        :rtype: :py:class:`PIL.Image`
+        """
+        for pos_x, pos_y, max_w, max_h, rotation, foreground in self._iter_foreground_rects():
+            self._image_paste(foreground, image, pos_x, pos_y, rotation)
         return image
 
     def _build_texts(self, image):
